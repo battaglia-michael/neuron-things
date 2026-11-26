@@ -1,46 +1,37 @@
-# Running Nemotron 3.5 Lightning 30B-A3B on Trainium2 with vLLM + vllm-neuron (Neuron SDK 2.33), compared with an H100
+# Nemotron 3.5 Lightning 30B-A3B on Trainium2 with vLLM + vllm-neuron (Neuron SDK 2.33), compared with an H100
 
-Serve [nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16)
-on one Trainium2 device with vLLM, on the public Neuron SDK 2.33 DLAMI
-(`Deep Learning AMI Neuron (Ubuntu 24.04) SDK 2.33.0 20261020`), BF16, with no NxD Inference, and compare it with
-stock vLLM on one NVIDIA H100 running NVIDIA's own recipe.
+- **What:** [NVIDIA Nemotron 3.5 Lightning 30B-A3B](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16),
+  a hybrid Mamba-2 / mixture-of-experts / attention model that Trainium2's vLLM stack did not support, ported to vLLM Neuron
+  on the native PyTorch backend (no NxD Inference), with six custom NKI kernels.
+- **Result:** the same accuracy as an H100, 5x to 11x faster than the first working port, 33 % to 62 % of one H100's
+  throughput per chip, and 84 % to 98 % of the H100's output tokens per dollar for a whole server.
+- **How:** run as an unattended loop of AI coding agents on Trainium2 Capacity Blocks, directed and reviewed by me
+  ([How this was done](#how-this-was-done)).
 
-The model is a hybrid: 23 Mamba-2 layers, 23 mixture-of-experts layers (128 experts, top-6, non-gated squared-ReLU)
-and 6 attention layers. The DLAMI's stock vllm-neuron (0.29.0.1.2.0) has no Neuron implementation of it and no
+The DLAMI's stock vllm-neuron (0.29.0.1.2.0) has no Neuron implementation of `NemotronHForCausalLM` and no
 per-request recurrent state, so engine start fails with
-`type object 'NemotronHForCausalLM' has no attribute 'from_configs'`. This guide installs one public branch on top
-of the DLAMI's vLLM environment:
+`type object 'NemotronHForCausalLM' has no attribute 'from_configs'`. This guide installs one public branch on top of
+the DLAMI's vLLM environment:
 
 | Branch | What it is |
 |---|---|
-| [battaglia-michael/vllm-neuron@contrib/nemotron-h-0.29](https://github.com/battaglia-michael/vllm-neuron/tree/contrib/nemotron-h-0.29) | vllm-neuron 0.29.0.1.2.0 plus the recurrent-state V1 runner from [PR #68](https://github.com/vllm-project/vllm-neuron/pull/68) (whn09's `contrib-qwen3-5`, Qwen3.5), plus `contrib/models/nemotron_h`: the model, six NKI kernels, and runner changes for decode attention, host-side input caching and prefix caching |
+| [battaglia-michael/vllm-neuron@contrib/nemotron-h-0.29](https://github.com/battaglia-michael/vllm-neuron/tree/contrib/nemotron-h-0.29) | vllm-neuron 0.29.0.1.2.0 plus the recurrent-state runner from [PR #68](https://github.com/vllm-project/vllm-neuron/pull/68) (Qwen3.5) and `contrib/models/nemotron_h`: the model, six NKI kernels and small runner changes |
 
-The model README on the branch has the usage, settings and tests:
-[contrib/models/nemotron_h/README.md](https://github.com/battaglia-michael/vllm-neuron/blob/contrib/nemotron-h-0.29/contrib/models/nemotron_h/README.md);
-the architecture, kernel choices and feature status are in
-[src/README.md](https://github.com/battaglia-michael/vllm-neuron/blob/contrib/nemotron-h-0.29/contrib/models/nemotron_h/src/README.md).
-This page covers the instance, the install, serving, the checks, and the results. The commands below are the ones
-used on the benchmark instances between 2026-11-11 and 2026-11-20. They were not re-run end to end on a fresh
-instance after the work finished.
+The branch's [model README](https://github.com/battaglia-michael/vllm-neuron/blob/contrib/nemotron-h-0.29/contrib/models/nemotron_h/README.md)
+has the usage and tests, and [src/README.md](https://github.com/battaglia-michael/vllm-neuron/blob/contrib/nemotron-h-0.29/contrib/models/nemotron_h/src/README.md)
+the architecture and kernel choices. The commands below are the ones used on the benchmark instances
+(2026-11-11 to 2026-11-20); they were not re-run on a fresh instance afterwards.
 
-Measured on one Trainium2 device (TP=4, LNC=2) and one H100 80 GB, BF16, with the final configuration
-(tag `best-v2c`):
+One Trainium2 device (TP=4, LNC=2) vs one H100 80 GB, BF16, final configuration (tag `best-v2c`):
 
-| Workload | Trainium2, one device | H100, one GPU | Trn2 / H100 |
+| Workload | Trainium2 | H100 | Trn2 / H100 |
 |---|---|---|---|
-| One request, 1,024 in / 1,024 out | 154 output tok/s, TTFT 178 ms, 6.3 ms per token | 249 tok/s, 75 ms, 3.9 ms | 0.62x |
-| One request, 8,192 in / 512 out (agent turn) | 135 tok/s, TTFT 558 ms, 6.3 ms per token | 235 tok/s, 158 ms, 4.0 ms | 0.57x |
-| One request, 1,024 in / 8,192 out (reasoning) | 156 tok/s, 6.4 ms per token | 252 tok/s, 4.0 ms | 0.62x |
-| One request, 32,768 in / 512 out | 90 tok/s, TTFT 2.35 s | 188 tok/s, 0.69 s | 0.48x |
-| 32 concurrent, 1,024 / 1,024 | 789 tok/s (TPOT 37.9 ms) | 1,775 tok/s (17.7 ms) | 0.44x |
-| 128 concurrent, 8,192 / 512 | 655 tok/s (TPOT 129 ms) | 2,006 tok/s (59.5 ms) | 0.33x |
-| Whole server, 32 per device, 1,024 / 1,024 | trn2.48xlarge: 10,242 tok/s (13 of 16 devices) | p5.48xlarge: 13,985 tok/s (8 GPUs) | 0.98x tokens per $ |
-| GSM8K, 1,319 questions, zero-shot CoT, greedy | 94.47 % | 95.00 % | |
-| Tool calling, 200 BFCL items | 83.0 % | 84.0 % | |
-| Needle retrieval at 1K / 16K / 32K / 128K | 20 / 20 | 20 / 20 | |
-
-Throughput is 5x to 11x the first working port on the same device, mostly from six custom NKI kernels.
-The H100 is still faster on every row; per dollar the two are close (see [Per instance and per dollar](#per-instance-and-per-dollar)).
+| One request, 1,024 in / 1,024 out | 154 tok/s, 6.3 ms per token | 249 tok/s, 3.9 ms | 0.62x |
+| One request, 8,192 in / 512 out (agent turn) | 135 tok/s, first token 558 ms | 235 tok/s, 158 ms | 0.57x |
+| 32 concurrent, 1,024 / 1,024 | 789 tok/s | 1,775 tok/s | 0.44x |
+| 128 concurrent, 8,192 / 512 | 655 tok/s | 2,006 tok/s | 0.33x |
+| Whole server, 1,024 / 1,024, output tokens per $ | trn2.48xlarge | p5.48xlarge | 0.98x |
+| GSM8K / tool calling / needle to 128K | 94.5 % / 83.0 % / 20 of 20 | 95.0 % / 84.0 % / 20 of 20 | |
 
 ![Output tokens/s as a share of one H100](docs/per_device.png)
 
@@ -53,7 +44,7 @@ The H100 is still faster on every row; per dollar the two are close (see [Per in
 5. [Check it](#5-check-it)
 6. [The H100 side](#6-the-h100-side)
 - [Results](#results), [Per instance and per dollar](#per-instance-and-per-dollar), [Accuracy](#accuracy), [FP8 and MTP variants](#fp8-and-mtp-variants)
-- [How it got faster](#how-it-got-faster), [Profiles](#profiles-before-and-after), [Troubleshooting](#troubleshooting), [Caveats](#caveats), [References](#references)
+- [How it got faster](#how-it-got-faster), [Profiles](#profiles-before-and-after), [How this was done](#how-this-was-done), [Troubleshooting](#troubleshooting), [Caveats](#caveats), [References](#references)
 
 ## 1. Launch the instance
 
@@ -160,9 +151,8 @@ taskset -c <the device's NUMA-node CPUs> vllm serve $MODEL_DIR --served-model-na
      "on_device_sampling_config": {"all_greedy": false}}}'
 ```
 
-The first start compiles the model graphs. With a warm NEFF cache, servers were ready in 5 to 22 minutes
-depending on the profile; a first start with an empty cache takes longer. Later starts reuse
-`~/.cache/neuron_libtorch`. The server is ready when the log shows `Application startup complete`.
+The first start compiles the graphs: 5 to 22 minutes with a warm cache, longer from empty. The server is ready
+when the log shows `Application startup complete`.
 
 ```bash
 curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
@@ -173,18 +163,17 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
 
 | Setting | Why |
 |---|---|
-| `NEURON_VISIBLE_DEVICES=0-3` | Selects the device by core ids. `NEURON_RT_VISIBLE_CORES` fails with `cannot be used with multi-processing execution on vLLM`. |
-| `NEURON_SKIP_EFA_AFFINITY=1` | Without EFA interfaces attached, engine start fails with `No EFA device found at /sys/bus/pci/devices/...`. |
-| `VLLM_NEURON_BACKEND=neuron_native` | The native PyTorch backend (TorchNeuron). |
-| `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.25` | Enough KV cache for 128 requests of 8,960 tokens: the scheduler admits at most `kv_cache_tokens // max_model_len` requests. More leaves too little HBM for the compiled graphs. |
-| `NEURON_RT_EXEC_TIMEOUT=300` | The runtime's default 30 s timeout killed the engine (`NRT_TIMEOUT`, `missing collectives status`) while the host was busy compiling other servers. |
-| `--max-num-batched-tokens 4096` with buckets `[2048, 4096]` | 4,096-token prefill chunks; the 2,048 bucket keeps a short prompt from padding to 4,096. |
-| No `decode_context_length_buckets` on S | With a 2,048-token context bucket the profile's graphs do not fit in HBM at load (`Allocation Failure`). L uses `[2048, 10240]`. |
-| `taskset` to the device's NUMA node (`SRV_CPUS=numa`) | About 1-2 % lower time per token at one request; no graph change. |
-| `VLLM_CACHE_ROOT` keyed by the model source and `NEMOTRON_H_*` env | vLLM's torch.compile cache is keyed by the vLLM config only, so after a code or flag change it restores stale graphs. The serve script sets a key per source and env. |
+| `NEURON_VISIBLE_DEVICES=0-3` | Picks the device by core ids (`NEURON_RT_VISIBLE_CORES` is rejected by vLLM's multi-process mode). |
+| `NEURON_SKIP_EFA_AFFINITY=1` | Without EFA interfaces, engine start fails with `No EFA device found`. |
+| `VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.25` | The scheduler admits at most `kv_cache_tokens // max_model_len` requests; 0.25 fits 128 x 8,960 tokens and leaves HBM for the graphs. |
+| `NEURON_RT_EXEC_TIMEOUT=300` | The default 30 s timeout killed the engine (`NRT_TIMEOUT`) while the host was compiling other servers. |
+| `--max-num-batched-tokens 4096`, buckets `[2048, 4096]` | 4,096-token prefill chunks; the 2,048 bucket keeps short prompts from padding to 4,096. |
+| No `decode_context_length_buckets` on S | With them, profile S's graphs did not fit in HBM (`Allocation Failure`). |
+| `taskset` to the device's NUMA node | 1-2 % lower time per token at one request. |
+| `VLLM_CACHE_ROOT` per model source and `NEMOTRON_H_*` env | vLLM's compile cache ignores both and would restore stale graphs. |
 
-The model's behavior can be changed with `NEMOTRON_H_*` environment variables (every kernel can be switched off,
-e.g. `NEMOTRON_H_MAMBA_PREFILL_KERNEL=0`). All results here use the defaults. The model README lists them.
+Every kernel can be switched off with a `NEMOTRON_H_*` variable (the model README lists them); all results use the
+defaults.
 
 ## 5. Check it
 
@@ -265,12 +254,10 @@ measured with every server running at once.
 | 8,192 / 512 | 6,071 tok/s | 9,705 tok/s | 0.63x | 0.84x |
 | 1,024 / 1,024 | 10,242 tok/s | 13,985 tok/s | 0.73x | 0.98x |
 
-- Prices: EC2 Capacity Block rates paid in us-east-2 in November 2026, trn2.48xlarge $35.76/h and p5.48xlarge $47.76/h.
-  Trainium2 is not offered on-demand in US regions; p5.48xlarge on-demand is $55.04/h. Prices move with supply.
-- Tokens per $ charges Trainium2 for all 16 devices. 3 devices were running other experiments during the run. Each
-  device's rate matched a single device running alone (467 vs 468 tok/s), so 16 devices would give about 7,472 and
-  12,606 tok/s (an estimate), or 1.03x and 1.20x the H100's tokens per $.
-- The 8 H100s together did 9,705 tok/s against 8 x 1,240 for one GPU alone in the same session.
+- Prices: EC2 Capacity Block rates paid in November 2026 (us-east-2): trn2.48xlarge $35.76/h, p5.48xlarge $47.76/h.
+  Trainium2 has no on-demand price in US regions; p5.48xlarge on-demand is $55.04/h.
+- Trainium2 is charged for all 16 devices, though 3 were busy with other experiments. Each device matched a single
+  device running alone, so all 16 would give an estimated 1.03x and 1.20x the H100's tokens per $.
 
 ### Accuracy
 
@@ -283,9 +270,8 @@ measured with every server running at once.
 | Tool calling, BFCL simple + multiple, 200 items | 83.0 % | 84.0 % |
 | Needle retrieval at 1K / 16K / 32K / 128K | 5 / 5 at each | 5 / 5 at each |
 
-The differences are within noise. Every kept optimization re-ran the first three checks before it was accepted.
-The Mamba step size is not clamped, as in NVIDIA's model code and vLLM on GPU (Hugging Face transformers clamps it in
-only one code path; the model README explains why this matters for the reference labels).
+The differences are within noise. Every kept optimization re-ran the first three checks first. The Mamba step size
+is not clamped, as in NVIDIA's code and vLLM on GPU (see the model README).
 
 ### FP8 and MTP variants
 
@@ -293,8 +279,8 @@ Both were tested as separate opt-in variants; neither is in the tables above.
 
 | Variant | Trainium2 | H100 |
 |---|---|---|
-| FP8 weights (`NEMOTRON_H_FP8=1` / `--quantization fp8`) | -2 % to +14 % vs BF16; passes the accuracy gate (token match 97.67 %, GSM8K 94.77 %, tools 82.0 %) | +4 % to +16 %; token match 96.74 %, which fails the 1-point rule; GSM8K 94.31 % |
-| MTP speculative decoding, 1 draft token | Greedy outputs not identical to decoding without MTP (18 of 32 test prompts identical); an exact version was slower than no MTP. Not adopted. | -7 % to +20 % depending on the row; GSM8K 95.00 % |
+| FP8 weights | -2 % to +14 % vs BF16; passes the accuracy gate | +4 % to +16 %; token match 96.7 %, fails the gate |
+| MTP speculative decoding, 1 draft token | outputs differ from normal decoding; the exact version was slower; not adopted | -7 % to +20 % by row; GSM8K unchanged |
 
 
 ## How it got faster
@@ -321,13 +307,11 @@ numbers and IDs (`T12`, `R2-03`) also appear in the branch's code comments.
 | R2-G | Host-side cache of per-step decode inputs | late steps 7.7 % → 0.07 % |
 | R2-C4 | Prefix caching with the fused Mamba prefill kernel | shared-prefix TTFT -17 % |
 
-Not kept (all measured): a split Mamba decode at 8-32 requests (41-52 % slower), an all-in-one MoE decode kernel,
-moving the MoE prefill kernel's transposes off the matrix engine (the kernel is limited by data movement), routed MoE
-decode at 32-128 requests, NKI matmuls in the decode graph, and an 8-way LNC=1 split (estimated, not built).
+Measured and dropped: a split Mamba decode (41-52 % slower), an all-in-one MoE decode kernel, routed MoE decode at
+32-128 requests, NKI matmuls in the decode graph, and moving the MoE prefill transposes off the matrix engine.
 
-Where the time goes now: one request is 6.3 ms per token against a floor of about 2.8 ms (MoE 2.8 ms and Mamba 1.9 ms
-are each still 2-3x their floors). Prefill MoE is two-thirds of time to first token and is limited by moving expert
-weights and tokens, not by the matrix math. At 32 or more requests the MoE still computes all experts.
+Where the gap is now: one request takes 6.3 ms per token against a hardware floor of about 2.8 ms, and prefill MoE,
+two-thirds of time to first token, is limited by data movement rather than math.
 
 ## Profiles, before and after
 
@@ -342,12 +326,17 @@ blue block on the top row is one generation step: about 175 ms before, about 35 
 |---|---|
 | ![](docs/neuron-explorer-decode-b32-before.png) | ![](docs/neuron-explorer-decode-b32-after.png) |
 
-## How this was run
+## How this was done
 
-The port, the kernels and the benchmarks were done by AI agents built from AWS's Neuron agentic development agents
-and skills (NKI kernel writing, vLLM Neuron porting, profiling, equivalence testing), running unattended in a loop on
-the instances: one task at a time from a queue, each with a time limit, a required result file, and the rule that no
-change is kept unless it passes the accuracy gate.
+I ran this as an unattended loop of AI coding agents (Kiro, with AWS's Neuron agentic development agents and skills
+for NKI kernels, vLLM Neuron porting and profiling) on Trainium2 Capacity Blocks, over about nine days. Each task ran
+from a queue with a time limit and a required result file, and no change was kept unless it passed the accuracy gate.
+
+- **The agents** wrote the port, the NKI kernels and the benchmark harness, and ran the profiles and measurements.
+- **I** set the goal and the ground rules (native PyTorch backend, no NxD Inference, a fair H100 baseline on NVIDIA's
+  own recipe, workloads based on agent, chat and reasoning use, the accuracy gate), decided what each round would try,
+  and managed the budget. I reviewed the code and the profiles to understand each change, made a few small code
+  changes, and redirected the work when results looked wrong or went off course.
 
 ## Troubleshooting
 
@@ -360,21 +349,17 @@ change is kept unless it passes the accuracy gate.
 | Server stays at e.g. `Running: 123 reqs, Waiting: 5 reqs` with low KV usage | The scheduler admits at most `kv_cache_tokens // max_model_len` requests. Raise the KV cap or lower `--max-model-len`. |
 | `missing collectives status ... NRT_TIMEOUT`, then `EngineDeadError`, under heavy host load | `export NEURON_RT_EXEC_TIMEOUT=300`. |
 | A code or `NEMOTRON_H_*` change has no effect, or `ModuleNotFoundError` for a kernel module at load | Stale torch.compile cache: use a fresh `VLLM_CACHE_ROOT` (the serve script keys it by source and env). |
-| `tdrv_hbm_scrub_wait ... HBM 0 scrub failed: timeout`, then the runtime cannot initialize | A faulty device. Use another device; it repeated on the same device across restarts. |
-| `/start_profile` returns 200 but writes no NTFF; `Failed to allocate 128.000MB ... profiler buffers` | HBM is full; the profiler needs room for its buffers. Profile with a lower KV cap. |
 | Engine start is very slow the first time | Expected: the cold compile. Later starts use `~/.cache/neuron_libtorch`. |
 
 
 ## Caveats
 
-- One run per cell in the result tables; no confidence intervals on speed. Host jitter is about 1-3 % at one request.
-- Random-token prompts (vLLM's `random` dataset): standard for serving benchmarks, but MoE routing on real text may
-  differ on both platforms.
-- Software versions differ: vLLM 0.27.1 on the H100 (NVIDIA's recipe) vs 0.29.0 on Trainium2 (pinned by Neuron SDK 2.33).
-- Mamba state precision differs: FP16 with stochastic rounding on the H100 (recipe), FP32 on Trainium2 (model default).
-- The H100 runs prefix caching and async scheduling (recipe); the Trainium2 headline runs without prefix caching.
-- The Trainium2 port depends on an unmerged community branch (V1 runner). Upstreaming needs recurrent-state support in
-  Model Runner V2.
+- One run per cell in the result tables (host jitter is about 1-3 % at one request); random-token prompts.
+- vLLM 0.27.1 on the H100 (NVIDIA's recipe) vs 0.29.0 on Trainium2 (pinned by Neuron SDK 2.33).
+- The H100 recipe keeps the Mamba state in FP16 and turns on prefix caching; the Trainium2 headline uses FP32 state and
+  no prefix caching.
+- The port depends on an unmerged community branch (PR #68); upstreaming it is proposed in
+  [vllm-project/vllm-neuron#132](https://github.com/vllm-project/vllm-neuron/issues/132).
 
 ## References
 
